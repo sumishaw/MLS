@@ -7,6 +7,9 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+env:
+  PROJECT_DIR: nihongo_v7   # Flutter project lives in this subdirectory
+
 jobs:
   build:
     name: Build & Sign APK
@@ -17,7 +20,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Java 17 (matches compileOptions / kotlinOptions) ────────────────
+      # ── 2. Java 17 (matches compileOptions / kotlinOptions in build.gradle) ─
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -29,7 +32,7 @@ jobs:
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.22.x'   # pin to a stable 3.x that supports Dart >=3.0.0 <4.0.0
+          flutter-version: '3.22.x'
           channel: 'stable'
           cache: true
 
@@ -40,61 +43,73 @@ jobs:
           dart --version
           java -version
 
-      # ── 5. Install Flutter dependencies ────────────────────────────────────
+      # ── 5. Disable Flutter analytics (avoids interactive prompt in CI) ─────
+      - name: Disable Flutter analytics
+        run: flutter config --no-analytics
+        working-directory: ${{ env.PROJECT_DIR }}
+
+      # ── 6. Install Flutter dependencies ────────────────────────────────────
       - name: Flutter pub get
         run: flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 6. Lint / analyse ──────────────────────────────────────────────────
+      # ── 7. Lint / analyse ──────────────────────────────────────────────────
       - name: Run Flutter analyze
         run: flutter analyze --no-fatal-infos
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 7. Unit tests ─────────────────────────────────────────────────────
+      # ── 8. Unit tests ──────────────────────────────────────────────────────
       - name: Run Flutter tests
         run: flutter test
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 8. Grant Gradle wrapper execute permission ─────────────────────────
+      # ── 9. Grant Gradle wrapper execute permission ─────────────────────────
       - name: Make gradlew executable
         run: chmod +x android/gradlew
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 9. Build debug APK (always) ────────────────────────────────────────
+      # ── 10. Build debug APK ────────────────────────────────────────────────
       - name: Build debug APK
         run: flutter build apk --debug --verbose
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 10. Build release APK ──────────────────────────────────────────────
-      #   Uses the debug signing config defined in build.gradle (signingConfigs.debug).
-      #   Replace with a proper keystore secret when you have one.
+      # ── 11. Build release APK ──────────────────────────────────────────────
+      #   Uses debug signing config (signingConfigs.debug) from build.gradle.
+      #   Swap for a real keystore secret when ready for production.
       - name: Build release APK
         run: flutter build apk --release --verbose
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 11. (Optional) Build App Bundle for Play Store ─────────────────────
+      # ── 12. Build App Bundle for Play Store ───────────────────────────────
       - name: Build release App Bundle
         run: flutter build appbundle --release --verbose
+        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 12. Upload debug APK artifact ──────────────────────────────────────
+      # ── 13. Upload debug APK artifact ─────────────────────────────────────
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: caption-lens-debug-apk
-          path: build/app/outputs/flutter-apk/app-debug.apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
 
-      # ── 13. Upload release APK artifact ────────────────────────────────────
+      # ── 14. Upload release APK artifact ───────────────────────────────────
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
           name: caption-lens-release-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           retention-days: 14
 
-      # ── 14. Upload App Bundle artifact ─────────────────────────────────────
+      # ── 15. Upload App Bundle artifact ────────────────────────────────────
       - name: Upload release App Bundle
         uses: actions/upload-artifact@v4
         with:
           name: caption-lens-release-aab
-          path: build/app/outputs/bundle/release/app-release.aab
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
           retention-days: 14
 
-  # ── Optional: release job triggered only on version tags ──────────────────
+  # ── Optional: GitHub Release created only on version tags (e.g. v7.0.0) ──
   release:
     name: Create GitHub Release
     needs: build
