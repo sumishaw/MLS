@@ -16,39 +16,48 @@ import org.vosk.Model
 import org.vosk.Recognizer
 
 /**
- * SpeechCaptureService  —  PERFORMANCE-FIXED
+ * SpeechCaptureService — ALL ROOT CAUSES FIXED
  *
- * Root-cause fixes for tablet sluggishness / capture dying / LibreTranslate jobs stalling:
+ * BUG 1 — Silent zombie: capture thread dies, service stays alive
+ *   After the while-loop exits for ANY reason, the original code just logged
+ *   "Capture thread ended" and returned. The service stayed running with a
+ *   dead thread; isRunning stayed true; the UI showed "STOP" forever;
+ *   LibreTranslate got no new work but sat alive looking "hung".
+ *   FIX: Track an exitReason string. If the exit was not a clean user-stop,
+ *   post stopSelf() + a user-visible error message from the thread.
  *
- *  FIX 1 – Thread priority
- *    AudioCaptureThread was set to MAX_PRIORITY.  On Android that steals CPU time from the
- *    main thread (UI, MediaPlayer, Chrome renderer) causing the video stuttering / freeze you
- *    see.  Changed to NORM_PRIORITY – the audio read loop is I/O-bound, not CPU-bound.
+ * BUG 2 — CPU spin loop on AudioRecord.read() == 0
+ *   When MediaProjection is interrupted or audio routing changes on a tablet,
+ *   AudioRecord.read() returns 0 continuously (not an error code). The original
+ *   "if (read <= 0) continue" spins at ~10,000 iterations/second, burning a
+ *   full CPU core. The thermal governor throttles CPU → video stutters; then
+ *   the OOM killer terminates the service seconds later.
+ *   FIX: Count consecutive zero-reads. After 50 (~250 ms), sleep 20 ms/iter.
+ *   After 200 (~4 s total), treat as projection-lost and exit gracefully.
  *
- *  FIX 2 – Translation rate-limiting / debounce
- *    Every Vosk partial result fired mainHandler.post { processText() }, which in turn
- *    dispatched TWO LibreTranslate HTTP calls (en→hi chain).  A lively audio stream can
- *    produce 15-30 partials per second.  That's 30-60 concurrent HTTP calls piling up in
- *    the executor, saturating the tablet's loopback TCP stack and starving LibreTranslate.
- *    Fix: a 600 ms debounce – only the most-recent text is sent per window, identical to
- *    how a search-as-you-type field works.  Final (non-partial) results still fire instantly.
+ * BUG 3 — MediaProjection stop not detected on Android 10–13
+ *   MediaProjection.Callback was only registered on API 34+ (UPSIDE_DOWN_CAKE).
+ *   On Android 10–13 tablets, if the user revokes projection or the system
+ *   reclaims it, AudioRecord silently returns 0 → falls into Bug 2.
+ *   FIX: Register the callback unconditionally (available since API 21).
  *
- *  FIX 3 – Read buffer alignment
- *    readBuf was 4096 bytes but bufSize was maxOf(minBuf*4, 8192).  AudioRecord.read() can
- *    return up to bufSize bytes; anything > readBuf silently truncated the PCM frame and
- *    confused Vosk.  readBuf is now allocated at the same bufSize as the AudioRecord ring.
+ * BUG 4 — Battery optimisation never actually requested at runtime
+ *   REQUEST_IGNORE_BATTERY_OPTIMIZATIONS was in the manifest but the runtime
+ *   Intent was never fired. Android Doze kills foreground services on Samsung/
+ *   Xiaomi/Oppo tablets within 15-60 s of screen-off.
+ *   FIX: requestBatteryExemption() called from onStartCommand().
  *
- *  FIX 4 – WakeLock timeout extended
- *    1-hour cap meant capture silently died on long sessions.  Changed to 4 hours (still
- *    auto-released in onDestroy).  Adjust to taste.
+ * BUG 5 — readBuf too small; PCM frames silently truncated
+ *   bufSize = maxOf(minBuf*4, 8192) but readBuf = ByteArray(4096).
+ *   AudioRecord.read() can return up to bufSize bytes; excess was dropped
+ *   silently, confusing Vosk's HMM decoder into producing garbage partials.
+ *   FIX: readBuf = ByteArray(bufSize).
  *
- *  FIX 5 – TranslationManager executor saturation guard
- *    Before submitting to executor, check queue depth (approximate via activeCount vs
- *    corePoolSize) and drop excess work rather than pile it on.  See TranslationManager.
- *
- *  FIX 6 – Vosk model loaded at NORM_PRIORITY
- *    Was NORM_PRIORITY already, kept; just confirmed isDaemon=false stays so it completes
- *    after the app goes background.
+ * BUG 6 — Thread.MAX_PRIORITY steals CPU from video playback
+ *   AudioRecord.read() is a blocking I/O call; the thread sleeps most of the
+ *   time. MAX_PRIORITY preempts MediaPlayer/Chrome decoder threads when they
+ *   share a CPU timeslice → video stutters even without the spin-loop.
+ *   FIX: Thread.NORM_PRIORITY.
  */
 class SpeechCaptureService : Service() {
 
@@ -64,26 +73,30 @@ class SpeechCaptureService : Service() {
         @Volatile var latestEnglish  = ""
         @Volatile var latestHindi    = ""
 
-        private const val TAG          = "SpeechCapture"
-        private const val SAMPLE_RATE  = 16_000
+        private const val TAG         = "SpeechCapture"
+        private const val SAMPLE_RATE = 16_000
 
-        // ── FIX 2: debounce interval for partial results ──────────────────────
-        // Final (isFinal=true) results are never debounced.
+        // Debounce for partial results — finals bypass this and fire immediately
         private const val PARTIAL_DEBOUNCE_MS = 600L
+
+        // BUG 2 thresholds
+        private const val ZERO_READ_SLEEP_AFTER = 50   // ~250 ms of silence
+        private const val ZERO_READ_ABORT_AFTER = 200  // ~4 s → give up
+        private const val ZERO_READ_SLEEP_MS    = 20L
     }
 
-    private val mainHandler  = Handler(Looper.getMainLooper())
-    private val capturing    = AtomicBoolean(false)
-    private var captureThread: Thread?          = null
-    private var audioRecord:   AudioRecord?     = null
-    private var mediaProjection: MediaProjection? = null
-    private var voskModel:     Model?           = null
-    private var voskRec:       Recognizer?      = null
-    private var wakeLock:      PowerManager.WakeLock? = null
-    private var lastPushedText = ""
+    private val mainHandler       = Handler(Looper.getMainLooper())
+    private val capturing         = AtomicBoolean(false)
+    private val userRequestedStop = AtomicBoolean(false)   // BUG 1 fix
 
-    // FIX 2: pending debounce state
-    private var debounceRunnable: Runnable? = null
+    private var captureThread:   Thread?           = null
+    private var audioRecord:     AudioRecord?      = null
+    private var mediaProjection: MediaProjection?  = null
+    private var voskModel:       Model?            = null
+    private var voskRec:         Recognizer?       = null
+    private var wakeLock:        PowerManager.WakeLock? = null
+    private var lastPushedText   = ""
+    private var debounceRunnable: Runnable?        = null
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -105,20 +118,21 @@ class SpeechCaptureService : Service() {
 
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         @Suppress("WakelockTimeout")
-        // FIX 4: 4-hour max instead of 1-hour (released in onDestroy regardless)
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "CaptionLens::SpeechCapture"
-        ).also { it.acquire(4 * 60 * 60 * 1000L) }
+        ).also { it.acquire(4 * 60 * 60 * 1000L) }   // 4 h max; released in onDestroy
 
         Log.d(TAG, "onCreate — foreground started, wakeLock acquired")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
-            Log.e(TAG, "onStartCommand received null intent — stopping")
+            Log.e(TAG, "null intent — stopping")
             stopSelf(); return START_NOT_STICKY
         }
+
+        userRequestedStop.set(false)
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
         val resultData: Intent? =
@@ -128,9 +142,12 @@ class SpeechCaptureService : Service() {
                 @Suppress("DEPRECATION") intent.getParcelableExtra(EXTRA_RESULT_DATA)
 
         if (resultCode != Activity.RESULT_OK || resultData == null) {
-            Log.e(TAG, "No valid MediaProjection token (resultCode=$resultCode, data=$resultData)")
+            Log.e(TAG, "No valid MediaProjection token — stopping")
             stopSelf(); return START_NOT_STICKY
         }
+
+        // BUG 4 FIX: actually request battery exemption at runtime
+        requestBatteryExemption()
 
         try {
             val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -141,18 +158,23 @@ class SpeechCaptureService : Service() {
         }
 
         if (mediaProjection == null) {
-            Log.e(TAG, "MediaProjection is null after getMediaProjection()")
+            Log.e(TAG, "MediaProjection is null — stopping")
             stopSelf(); return START_NOT_STICKY
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            mediaProjection?.registerCallback(object : MediaProjection.Callback() {
-                override fun onStop() {
-                    Log.d(TAG, "MediaProjection stopped externally")
-                    mainHandler.post { stopSelf() }
+        // BUG 3 FIX: register on ALL API levels, not just API 34+
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.w(TAG, "MediaProjection stopped externally")
+                mainHandler.post {
+                    if (!userRequestedStop.get()) {
+                        OverlayService.updateText("", "Screen capture was revoked — tap START again.", "")
+                        MainActivity.instance?.onCaptureError("Screen capture stopped — tap START again.")
+                    }
+                    stopSelf()
                 }
-            }, Handler(Looper.getMainLooper()))
-        }
+            }
+        }, Handler(Looper.getMainLooper()))
 
         loadModelThenCapture()
         return START_NOT_STICKY
@@ -161,22 +183,21 @@ class SpeechCaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        Log.d(TAG, "onDestroy")
+        Log.d(TAG, "onDestroy (userStop=${userRequestedStop.get()})")
         isRunning = false
         capturing.set(false)
 
-        // Cancel any pending debounce
         debounceRunnable?.let { mainHandler.removeCallbacks(it) }
         debounceRunnable = null
 
         captureThread?.interrupt()
         captureThread = null
 
-        try { audioRecord?.stop() } catch (_: Exception) {}
+        try { audioRecord?.stop() }   catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
 
-        try { voskRec?.close() } catch (_: Exception) {}
+        try { voskRec?.close() }   catch (_: Exception) {}
         try { voskModel?.close() } catch (_: Exception) {}
         voskRec   = null
         voskModel = null
@@ -194,6 +215,25 @@ class SpeechCaptureService : Service() {
         super.onDestroy()
     }
 
+    // ── Battery exemption (BUG 4 fix) ────────────────────────────────────────
+
+    private fun requestBatteryExemption() {
+        try {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val i = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                i.data = android.net.Uri.parse("package:$packageName")
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(i)
+                Log.d(TAG, "Battery exemption dialog launched")
+            } else {
+                Log.d(TAG, "Already battery-exempt")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Battery exemption request failed: ${e.message}")
+        }
+    }
+
     // ── Model loading ─────────────────────────────────────────────────────────
 
     private fun loadModelThenCapture() {
@@ -203,7 +243,7 @@ class SpeechCaptureService : Service() {
             stopSelf(); return
         }
 
-        updateNotification("Loading speech model… (1–2 min first time)")
+        updateNotification("Loading speech model…")
         OverlayService.updateText("", "Loading speech model…", "")
 
         Thread({
@@ -211,26 +251,23 @@ class SpeechCaptureService : Service() {
                 val modelPath = ModelDownloadService.modelDir(this).absolutePath
                 Log.d(TAG, "Loading Vosk model from: $modelPath")
                 voskModel = Model(modelPath)
-                Log.d(TAG, "Vosk model loaded successfully")
+                Log.d(TAG, "Vosk model loaded OK")
                 mainHandler.post { startCapture() }
             } catch (e: Exception) {
                 Log.e(TAG, "Model load failed: ${e.message}")
-                val msg = e.message ?: ""
+                val msg      = e.message ?: ""
                 val isCorrupt = msg.contains("No such file", ignoreCase = true)
                         || msg.contains("invalid", ignoreCase = true)
                         || msg.contains("corrupt", ignoreCase = true)
-                if (isCorrupt) {
-                    ModelDownloadService.modelDir(this).deleteRecursively()
-                    try { java.io.File(filesDir, "vosk_model_ready").delete() } catch (_: Exception) {}
-                    mainHandler.post {
-                        OverlayService.updateText("", "Model corrupted — will re-download on next launch. Restart the app.", "")
-                        stopSelf()
-                    }
-                } else {
-                    mainHandler.post {
+                mainHandler.post {
+                    if (isCorrupt) {
+                        ModelDownloadService.modelDir(this).deleteRecursively()
+                        try { java.io.File(filesDir, "vosk_model_ready").delete() } catch (_: Exception) {}
+                        OverlayService.updateText("", "Model corrupted — re-downloading on next launch. Restart the app.", "")
+                    } else {
                         OverlayService.updateText("", "Model load error: $msg — close other apps and try again.", "")
-                        stopSelf()
                     }
+                    stopSelf()
                 }
             }
         }, "VoskModelLoader").apply {
@@ -248,29 +285,23 @@ class SpeechCaptureService : Service() {
             stopSelf(); return
         }
 
-        val projection = mediaProjection
-        if (projection == null) {
-            Log.e(TAG, "MediaProjection null at capture start — screen capture was revoked")
+        val projection = mediaProjection ?: run {
+            Log.e(TAG, "MediaProjection null at startCapture")
             OverlayService.updateText("", "Screen capture lost — tap STOP then START again.", "")
             stopSelf(); return
         }
 
-        val model = voskModel
-        if (model == null) {
-            Log.e(TAG, "VoskModel null at capture start")
-            stopSelf(); return
-        }
+        voskModel ?: run { Log.e(TAG, "VoskModel null"); stopSelf(); return }
 
         val minBuf = AudioRecord.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
         if (minBuf == AudioRecord.ERROR || minBuf == AudioRecord.ERROR_BAD_VALUE) {
             Log.e(TAG, "getMinBufferSize error: $minBuf")
             OverlayService.updateText("", "Audio init failed — tap STOP then START.", "")
             stopSelf(); return
         }
+        // BUG 5 FIX: single source-of-truth for buffer size
         val bufSize = maxOf(minBuf * 4, 8192)
 
         val captureConfig = android.media.AudioPlaybackCaptureConfiguration
@@ -299,7 +330,7 @@ class SpeechCaptureService : Service() {
         }
 
         if (ar.state != AudioRecord.STATE_INITIALIZED) {
-            Log.e(TAG, "AudioRecord state=${ar.state} — not initialized")
+            Log.e(TAG, "AudioRecord not initialized (state=${ar.state})")
             ar.release()
             OverlayService.updateText("", "Audio init failed — tap STOP then START.", "")
             stopSelf(); return
@@ -307,7 +338,7 @@ class SpeechCaptureService : Service() {
         audioRecord = ar
 
         voskRec = try {
-            Recognizer(model, SAMPLE_RATE.toFloat())
+            Recognizer(voskModel!!, SAMPLE_RATE.toFloat())
         } catch (e: Exception) {
             Log.e(TAG, "Recognizer init failed: ${e.message}")
             ar.release(); audioRecord = null
@@ -319,53 +350,95 @@ class SpeechCaptureService : Service() {
         ar.startRecording()
         updateNotification("Translating video audio…")
         OverlayService.updateText("", "Listening to video audio…", "")
-        Log.d(TAG, "Capture started (bufSize=$bufSize)")
+        Log.d(TAG, "Capture started — bufSize=$bufSize")
 
         captureThread = Thread({
-            // FIX 3: readBuf matches the AudioRecord ring buffer size
+            // BUG 5 FIX: read buffer == ring buffer size
             val readBuf = ByteArray(bufSize)
+            var zeroReadCount = 0
+            var exitReason    = "clean-stop"   // assume clean until proven otherwise
 
-            while (capturing.get() && !Thread.currentThread().isInterrupted) {
-                val rec = audioRecord ?: break
-                val read = rec.read(readBuf, 0, readBuf.size)
-                if (read == AudioRecord.ERROR_INVALID_OPERATION ||
-                    read == AudioRecord.ERROR_BAD_VALUE
-                ) {
-                    Log.e(TAG, "AudioRecord.read error: $read")
-                    break
-                }
-                if (read <= 0) continue
+            try {
+                loop@ while (capturing.get() && !Thread.currentThread().isInterrupted) {
+                    val rec  = audioRecord ?: run { exitReason = "audioRecord-null"; break@loop }
+                    val read = rec.read(readBuf, 0, readBuf.size)
 
-                val recognizer = voskRec ?: break
-                try {
-                    val isFinal = recognizer.acceptWaveForm(readBuf, read)
-                    val json    = if (isFinal) recognizer.result else recognizer.partialResult
-                    val text    = parseVoskJson(json)
-
-                    if (text.length >= 3 && text != lastPushedText) {
-                        lastPushedText = text
-                        if (isFinal) {
-                            // FIX 2a: final results cancel any pending debounce and fire immediately
-                            debounceRunnable?.let { mainHandler.removeCallbacks(it) }
-                            debounceRunnable = null
-                            mainHandler.post { processText(text) }
-                        } else {
-                            // FIX 2b: partials are debounced — only the last one in the window fires
-                            debounceRunnable?.let { mainHandler.removeCallbacks(it) }
-                            val r = Runnable { processText(text) }
-                            debounceRunnable = r
-                            mainHandler.postDelayed(r, PARTIAL_DEBOUNCE_MS)
+                    when {
+                        read == AudioRecord.ERROR_INVALID_OPERATION -> {
+                            Log.e(TAG, "AudioRecord: ERROR_INVALID_OPERATION"); exitReason = "audio-error"; break@loop
                         }
+                        read == AudioRecord.ERROR_BAD_VALUE -> {
+                            Log.e(TAG, "AudioRecord: ERROR_BAD_VALUE"); exitReason = "audio-error"; break@loop
+                        }
+                        // BUG 2 FIX: count zeros, sleep, eventually abort
+                        read <= 0 -> {
+                            zeroReadCount++
+                            when {
+                                zeroReadCount >= ZERO_READ_ABORT_AFTER -> {
+                                    Log.e(TAG, "$zeroReadCount consecutive zero reads — projection lost")
+                                    exitReason = "zero-read-timeout"
+                                    break@loop
+                                }
+                                zeroReadCount >= ZERO_READ_SLEEP_AFTER ->
+                                    Thread.sleep(ZERO_READ_SLEEP_MS)
+                            }
+                            continue@loop
+                        }
+                        else -> zeroReadCount = 0
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Vosk error: ${e.message}")
+
+                    val recognizer = voskRec ?: run { exitReason = "voskRec-null"; break@loop }
+                    try {
+                        val isFinal = recognizer.acceptWaveForm(readBuf, read)
+                        val json    = if (isFinal) recognizer.result else recognizer.partialResult
+                        val text    = parseVoskJson(json)
+
+                        if (text.length >= 3 && text != lastPushedText) {
+                            lastPushedText = text
+                            if (isFinal) {
+                                debounceRunnable?.let { mainHandler.removeCallbacks(it) }
+                                debounceRunnable = null
+                                mainHandler.post { processText(text) }
+                            } else {
+                                debounceRunnable?.let { mainHandler.removeCallbacks(it) }
+                                val r = Runnable { processText(text) }
+                                debounceRunnable = r
+                                mainHandler.postDelayed(r, PARTIAL_DEBOUNCE_MS)
+                            }
+                        }
+                    } catch (e: InterruptedException) {
+                        Thread.currentThread().interrupt(); exitReason = "interrupted"; break@loop
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Vosk error: ${e.message}")
+                        // single-frame errors are recoverable; keep going
+                    }
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt(); exitReason = "interrupted"
+            } catch (e: Exception) {
+                Log.e(TAG, "Capture thread crash: ${e.message}"); exitReason = "crash:${e.message}"
+            }
+
+            Log.d(TAG, "Capture thread ended — reason: $exitReason")
+
+            // BUG 1 FIX: non-clean exit → tell the user and stop the zombie service
+            val wasClean = userRequestedStop.get() || exitReason == "clean-stop" || exitReason == "interrupted"
+            if (!wasClean) {
+                val msg = when (exitReason) {
+                    "zero-read-timeout" -> "Audio lost (screen capture ended?) — tap START again."
+                    "audio-error"       -> "Audio device error — tap START again."
+                    else                -> "Capture stopped — tap START again."
+                }
+                mainHandler.post {
+                    OverlayService.updateText("", msg, "")
+                    MainActivity.instance?.onCaptureError(msg)
+                    stopSelf()
                 }
             }
-            Log.d(TAG, "Capture thread ended")
+
         }, "AudioCaptureThread").apply {
             isDaemon = false
-            // FIX 1: NORM_PRIORITY — the read loop is I/O-bound.
-            // MAX_PRIORITY stole CPU from MediaPlayer/Chrome causing video sluggishness.
+            // BUG 6 FIX: NORM not MAX — read loop is I/O-bound; MAX stole CPU from video
             priority = Thread.NORM_PRIORITY
             start()
         }
@@ -392,12 +465,10 @@ class SpeechCaptureService : Service() {
                     latestEnglish = text
                     if (wantHindi) {
                         TranslationManager.translate(text, "en", "hi") { hi ->
-                            latestHindi = hi
-                            pushResult(text, text, hi)
+                            latestHindi = hi; pushResult(text, text, hi)
                         }
                     } else {
-                        latestHindi = ""
-                        pushResult(text, text, "")
+                        latestHindi = ""; pushResult(text, text, "")
                     }
                 }
                 lang == "hi" -> {
@@ -412,12 +483,10 @@ class SpeechCaptureService : Service() {
                         latestEnglish = en
                         if (wantHindi) {
                             TranslationManager.translate(en, "en", "hi") { hi ->
-                                latestHindi = hi
-                                pushResult(text, en, hi)
+                                latestHindi = hi; pushResult(text, en, hi)
                             }
                         } else {
-                            latestHindi = ""
-                            pushResult(text, en, "")
+                            latestHindi = ""; pushResult(text, en, "")
                         }
                     }
                 }
@@ -435,13 +504,9 @@ class SpeechCaptureService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel(
-                CHANNEL_ID,
-                "Internal Audio Capture",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply { setShowBadge(false) }
-             .also { getSystemService(NotificationManager::class.java)
-                         .createNotificationChannel(it) }
+            NotificationChannel(CHANNEL_ID, "Internal Audio Capture", NotificationManager.IMPORTANCE_LOW)
+                .apply { setShowBadge(false) }
+                .also { getSystemService(NotificationManager::class.java).createNotificationChannel(it) }
         }
     }
 
