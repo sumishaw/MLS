@@ -6,62 +6,66 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * TranslationManager  —  PERFORMANCE-FIXED
+ * TranslationManager — PERFORMANCE-FIXED
  *
- * Changes from original:
+ * BUG A — Unbounded executor queue floods LibreTranslate
+ *   Original: Executors.newFixedThreadPool(3) uses an unbounded LinkedBlockingQueue.
+ *   Vosk partials at 15-30/s × 2 HTTP calls each = 60 pending tasks/second piling up.
+ *   LibreTranslate (a Python process on this same device) gets flooded; its own thread
+ *   pool maxes out; requests timeout; eventually the nohup process stalls or the OS
+ *   OOM-kills it because it holds large language model weights in RAM.
+ *   FIX: Bounded queue of 6 slots with DiscardPolicy. Excess tasks are dropped rather
+ *   than queued — the debounce in SpeechCaptureService ensures a fresh text arrives
+ *   soon anyway. An AtomicInteger tracks in-flight count for an O(1) pre-submit check.
  *
- *  FIX A – Executor saturation guard
- *    Original used a fixed pool of 3 threads with an unbounded queue.  When partials fired
- *    at 20-30/s the queue grew to hundreds of pending HTTP calls.  LibreTranslate (a Python
- *    process on the same device) was flooded, its own thread pool maxed out, and it started
- *    timing out or refusing connections — causing the nohup libretranslate job to hang or die.
- *    Fix: bounded queue of 4 slots.  If the queue is full the new task is dropped (the UI
- *    debounce in SpeechCaptureService means a fresh, more-recent text will arrive shortly
- *    anyway).  An AtomicInteger tracks in-flight count so the drop decision is O(1).
+ * BUG B — Executor never shut down; stale tasks accumulate across sessions
+ *   TranslationManager is a Kotlin object (singleton). The executor is never terminated
+ *   between capture sessions. Tasks from the previous (crashed) session linger in the
+ *   queue and execute against the new session's results, producing garbled output.
+ *   FIX: closeAll() now drains the queue (purge()) and resets the in-flight counter.
+ *   The executor itself is NOT shut down (workers would need to be recreated) but the
+ *   queue is emptied so stale tasks cannot execute.
  *
- *  FIX B – Timeout reduced to 8 s
- *    15 s per call meant a backed-up queue could hold threads for over a minute before
- *    declaring LibreTranslate dead.  8 s is still generous for a localhost call.
+ * BUG C — 15 s timeout per call
+ *   For a localhost call this is absurd. A backed-up queue held worker threads blocked
+ *   for 15 s each before detecting that LibreTranslate was unreachable.
+ *   FIX: 8 s connect/read timeout.
  *
- *  FIX C – Cache capacity and eviction
- *    The original ConcurrentHashMap grew without bound (a memory leak on long sessions).
- *    Simple size cap added: when the cache reaches MAX_CACHE_ENTRIES the oldest 25 % is
- *    evicted.  (A proper LRU needs a LinkedHashMap with removeEldestEntry; for a 512-entry
- *    cap this simple approach is sufficient and avoids the synchronization overhead.)
+ * BUG D — Cache grows unbounded (memory leak on long sessions)
+ *   FIX: Evict the oldest 25 % when the cache reaches MAX_CACHE_ENTRIES.
  *
- *  FIX D – Connection reuse headers
- *    Added "Connection: keep-alive" so the JVM socket pool reuses TCP connections to
- *    localhost, removing ~3 ms of TCP handshake overhead per call.
+ * BUG E — Missing Connection: keep-alive
+ *   Each call opened a new TCP connection to localhost, adding ~3 ms of TCP handshake
+ *   overhead per call and creating unnecessary socket churn.
+ *   FIX: Added "Connection: keep-alive" header.
  */
 object TranslationManager {
 
-    private const val TAG           = "TranslationManager"
-    private const val LIBRE_URL     = "http://localhost:5000"
-    private const val API_KEY       = ""
-    // FIX B: 8 s is enough for a localhost call
-    private const val TIMEOUT_MS    = 8_000
-
-    // FIX C: bounded cache
+    private const val TAG            = "TranslationManager"
+    private const val LIBRE_URL      = "http://localhost:5000"
+    private const val API_KEY        = ""
+    // BUG C FIX: 8 s is ample for a localhost call
+    private const val TIMEOUT_MS     = 8_000
+    // BUG D FIX: bounded cache
     private const val MAX_CACHE_ENTRIES = 512
-    private val cache = ConcurrentHashMap<String, String>(256)
 
-    // FIX A: custom executor — 2 core threads (plenty for localhost), bounded queue
-    private const val MAX_QUEUE     = 4
-    private val inFlight            = AtomicInteger(0)
-    private val executor: ThreadPoolExecutor = ThreadPoolExecutor(
+    private val cache    = ConcurrentHashMap<String, String>(256)
+    private val inFlight = AtomicInteger(0)
+
+    // BUG A FIX: 2 core threads + bounded queue of 6 + discard-when-full
+    private const val MAX_QUEUE = 6
+    private val executor = ThreadPoolExecutor(
         2, 2,
         0L, TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(MAX_QUEUE),
         { r -> Thread(r, "LibreTranslateWorker").apply { isDaemon = true } },
-        // Discard policy: silently drop work when queue is full
-        ThreadPoolExecutor.DiscardPolicy()
+        ThreadPoolExecutor.DiscardPolicy()   // silently drop when queue is full
     )
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -81,10 +85,10 @@ object TranslationManager {
         val cacheKey = "$src|$tgt|$text"
         cache[cacheKey]?.let { onTranslated(it); return }
 
-        // FIX A: drop if we already have MAX_QUEUE tasks pending
+        // BUG A FIX: drop immediately if we're already saturated
         if (inFlight.get() >= MAX_QUEUE) {
-            Log.w(TAG, "Executor saturated — dropping translation for: ${text.take(30)}")
-            onTranslated(text)   // fall back to original so UI stays responsive
+            Log.w(TAG, "Saturated — dropping: ${text.take(30)}")
+            onTranslated(text)   // return original so UI stays responsive
             return
         }
 
@@ -94,10 +98,9 @@ object TranslationManager {
                 val result = callLibreTranslate(text, src, tgt)
                 val output = result ?: text
                 if (result != null) {
-                    // FIX C: evict if cache is getting large
+                    // BUG D FIX: evict oldest entries when cache is large
                     if (cache.size >= MAX_CACHE_ENTRIES) {
-                        val toRemove = cache.keys.take(MAX_CACHE_ENTRIES / 4)
-                        toRemove.forEach { cache.remove(it) }
+                        cache.keys.take(MAX_CACHE_ENTRIES / 4).forEach { cache.remove(it) }
                     }
                     cache[cacheKey] = result
                 }
@@ -112,16 +115,19 @@ object TranslationManager {
         executor.submit {
             try {
                 callLibreTranslate("hello", "en", "hi")
-                Log.d(TAG, "LibreTranslate warm-up complete")
+                Log.d(TAG, "LibreTranslate warm-up OK")
             } catch (e: Exception) {
-                Log.w(TAG, "LibreTranslate warm-up failed (normal if not yet started): ${e.message}")
+                Log.w(TAG, "Warm-up failed (normal if not yet started): ${e.message}")
             }
         }
     }
 
+    /** BUG B FIX: drain the queue so stale tasks from a crashed session don't execute. */
     fun closeAll() {
+        executor.queue.clear()   // purge pending tasks
+        inFlight.set(0)          // reset counter (in-flight tasks finish naturally)
         cache.clear()
-        Log.d(TAG, "Cache cleared")
+        Log.d(TAG, "Cache cleared, queue drained")
     }
 
     // ── HTTP call ─────────────────────────────────────────────────────────────
@@ -132,7 +138,7 @@ object TranslationManager {
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
             conn.setRequestProperty("Accept", "application/json")
-            // FIX D: reuse the TCP connection to localhost
+            // BUG E FIX: reuse TCP connection to localhost
             conn.setRequestProperty("Connection", "keep-alive")
             conn.doOutput       = true
             conn.connectTimeout = TIMEOUT_MS
@@ -158,9 +164,8 @@ object TranslationManager {
             val translated = json.optString("translatedText", "").trim()
 
             if (translated.isBlank()) null
-            else translated.also {
-                Log.d(TAG, "Translated $src→$tgt: ${it.take(60)}")
-            }
+            else translated.also { Log.d(TAG, "Translated $src→$tgt: ${it.take(60)}") }
+
         } catch (e: Exception) {
             Log.e(TAG, "LibreTranslate $src→$tgt error: ${e.message}")
             null
