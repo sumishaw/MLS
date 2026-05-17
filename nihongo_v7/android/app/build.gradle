@@ -1,0 +1,59 @@
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+    id 'dev.flutter.flutter-gradle-plugin'
+}
+
+android {
+    namespace 'com.example.nihongolens'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.example.nihongolens"
+        minSdk 29          // API 29 = Android 10, required for AudioPlaybackCaptureConfiguration
+        targetSdk 34
+        versionCode 7
+        versionName "7.0"
+        multiDexEnabled true
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+            shrinkResources false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions { jvmTarget = '17' }
+
+    packagingOptions {
+        resources {
+            excludes += [
+                'META-INF/DEPENDENCIES',
+                'META-INF/LICENSE',
+                'META-INF/LICENSE.txt',
+                'META-INF/NOTICE',
+                'META-INF/NOTICE.txt',
+            ]
+        }
+    }
+}
+
+flutter { source '../..' }
+
+dependencies {
+    // Vosk offline ASR — model downloaded at runtime from alphacephei.com, NOT bundled in APK
+    implementation 'com.alphacephei:vosk-android:0.3.47'
+
+    // ML Kit language identification — works fully offline, ~1 MB, no Google servers at runtime
+    implementation 'com.google.mlkit:language-id:17.0.4'
+
+    // LibreTranslate uses plain HttpURLConnection — no extra dependency needed
+    implementation 'androidx.multidex:multidex:2.0.1'
+}

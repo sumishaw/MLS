@@ -1,0 +1,21 @@
+// nihongo_v7/android/build.gradle  (root-level)
+// Plugin versions are declared in settings.gradle.
+// This file only holds project-wide configuration.
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.buildDir = '../build'
+
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+    project.evaluationDependsOn(':app')
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.nihongolens">
+
+    <!-- RECORD_AUDIO required by AudioPlaybackCaptureConfiguration even though mic is never opened -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Floating overlay over other apps -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Foreground service base permission -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- API 34+: each FGS type needs explicit permission -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Keep CPU alive during download / capture -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Show download/capture progress notifications -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Battery: ignore optimisations so services survive screen-off -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Network: model download + LibreTranslate on localhost -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:name="android.app.Application"
+        android:label="Caption Lens"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <meta-data android:name="flutterEmbedding" android:value="2" />
+
+        <!-- Downloads the 1.8 GB Vosk model on first launch -->
+        <service
+            android:name=".ModelDownloadService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!--
+            Captures INTERNAL device audio via MediaProjection + AudioPlaybackCapture.
+            foregroundServiceType must list BOTH mediaProjection AND microphone because
+            AudioRecord requires the microphone FGS type on API 34+ even when using
+            AudioPlaybackCaptureConfiguration (no physical mic is opened).
+        -->
+        <service
+            android:name=".SpeechCaptureService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection|microphone" />
+
+        <!-- Floating subtitle overlay -->
+        <service
+            android:name=".OverlayService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="caption_overlay" />
+        </service>
+
+    </application>
+
+</manifest>
