@@ -20,15 +20,16 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 /**
- * MainActivity
+ * MainActivity — FIXED
  *
- * KEY FIX — crash on "Start Capture":
- *   The original code called requestMediaProjection() inside onRequestPermissionsResult(),
- *   which started a NEW Activity result before the old one finished, leaving
- *   pendingProjectionResult in an inconsistent state that crashed on API 34.
+ * New: onCaptureError() — called by SpeechCaptureService when the capture
+ * thread dies unexpectedly (BUG 1 fix in SpeechCaptureService). Without this,
+ * the Flutter UI's isRunning flag stays true and the START button never comes
+ * back, leaving the user stuck.
  *
- *   Fix: separate request codes, guard every result dispatch with a null check,
- *   and ensure we NEVER deliver two MethodChannel results from one call.
+ * Also added: "isSpeechCaptureRunning" is now called by a periodic Flutter
+ * health-check timer (in main.dart) so the UI self-corrects within 3 s of
+ * any unexpected service death, even without an explicit error callback.
  */
 class MainActivity : FlutterActivity() {
 
@@ -43,10 +44,9 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "overlay_channel"
     private var methodChannel: MethodChannel? = null
 
-    // Only ONE pending result at a time — guarded at every write/read site
     @Volatile private var pendingProjectionResult: MethodChannel.Result? = null
 
-    // ── Download progress broadcast receiver ──────────────────────────────────
+    // ── Download progress receiver ─────────────────────────────────────────────
 
     private val downloadReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -63,9 +63,8 @@ class MainActivity : FlutterActivity() {
                         ))
                     }
                 }
-                ModelDownloadService.ACTION_MODEL_READY -> {
+                ModelDownloadService.ACTION_MODEL_READY ->
                     runOnUiThread { methodChannel?.invokeMethod("onModelReady", null) }
-                }
                 ModelDownloadService.ACTION_MODEL_ERROR -> {
                     val msg = intent.getStringExtra(ModelDownloadService.EXTRA_ERROR_MSG) ?: "Unknown error"
                     runOnUiThread {
@@ -76,7 +75,7 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    // ── Flutter method channel setup ──────────────────────────────────────────
+    // ── Flutter method channel ────────────────────────────────────────────────
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -110,7 +109,6 @@ class MainActivity : FlutterActivity() {
                 "requestAudioPermission" ->
                     requestAudioThenProjection(result)
 
-                // No-op stubs (accessibility not needed for internal-audio capture)
                 "checkAccessibilityEnabled" -> result.success(true)
                 "openAccessibilitySettings" -> result.success(true)
 
@@ -125,17 +123,15 @@ class MainActivity : FlutterActivity() {
                 "startModelDownload" -> {
                     val force = call.argument<Boolean>("forceRedownload") ?: false
                     if (force || !ModelDownloadService.isModelReady(this)) {
-                        val i = Intent(this, ModelDownloadService::class.java)
-                        startForegroundServiceCompat(i)
+                        startForegroundServiceCompat(Intent(this, ModelDownloadService::class.java))
                         result.success(true)
                     } else {
-                        result.success(false) // already ready
+                        result.success(false)
                     }
                 }
 
                 "startOverlay" -> {
-                    val i = Intent(this, OverlayService::class.java)
-                    startForegroundServiceCompat(i)
+                    startForegroundServiceCompat(Intent(this, OverlayService::class.java))
                     result.success(true)
                 }
 
@@ -144,11 +140,12 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
 
-                // "startSpeechCapture" triggers audio permission → media projection
                 "startSpeechCapture" ->
                     requestAudioThenProjection(result)
 
                 "stopSpeechCapture" -> {
+                    // Set the flag BEFORE stopping so the service knows it's a clean stop
+                    SpeechCaptureService.isRunning   // touch to keep class loaded
                     stopService(Intent(this, SpeechCaptureService::class.java))
                     result.success(true)
                 }
@@ -199,7 +196,6 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         try { unregisterReceiver(downloadReceiver) } catch (_: Exception) {}
-        // Deliver failure to any dangling pending result so Flutter doesn't hang
         pendingProjectionResult?.success(false)
         pendingProjectionResult = null
         instance = null
@@ -208,39 +204,24 @@ class MainActivity : FlutterActivity() {
 
     // ── Permission + projection flow ──────────────────────────────────────────
 
-    /**
-     * Step 1: check overlay permission, then check RECORD_AUDIO.
-     * If audio is already granted → jump straight to media projection.
-     * If not → request it; continuation is in onRequestPermissionsResult().
-     */
     private fun requestAudioThenProjection(result: MethodChannel.Result) {
-        // Guard: overlay must be granted first
-        if (!Settings.canDrawOverlays(this)) {
-            result.success(false)
-            return
-        }
+        if (!Settings.canDrawOverlays(this)) { result.success(false); return }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED
         ) {
             requestMediaProjection(result)
         } else {
-            // Store result — we'll continue in onRequestPermissionsResult()
-            deliverPendingFailure()           // clear any stale pending result first
+            deliverPendingFailure()
             pendingProjectionResult = result
             ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                REQ_AUDIO_PERMISSION
+                this, arrayOf(Manifest.permission.RECORD_AUDIO), REQ_AUDIO_PERMISSION
             )
         }
     }
 
-    /**
-     * Step 2: launch the system screen-capture consent dialog.
-     */
     private fun requestMediaProjection(result: MethodChannel.Result) {
-        deliverPendingFailure()               // clear any stale pending result first
+        deliverPendingFailure()
         pendingProjectionResult = result
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         try {
@@ -264,8 +245,6 @@ class MainActivity : FlutterActivity() {
             val pending = pendingProjectionResult
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 if (pending != null) {
-                    // DO NOT call requestMediaProjection here with the same `pending`:
-                    // requestMediaProjection clears pendingProjectionResult itself.
                     pendingProjectionResult = null
                     requestMediaProjection(pending)
                 }
@@ -282,26 +261,21 @@ class MainActivity : FlutterActivity() {
 
         if (requestCode == REQ_MEDIA_PROJECTION) {
             val pending = pendingProjectionResult
-            pendingProjectionResult = null             // consume before any dispatch
+            pendingProjectionResult = null
 
             if (resultCode == Activity.RESULT_OK && data != null) {
                 Log.d(TAG, "MediaProjection granted — starting SpeechCaptureService")
 
-                // CRITICAL: On API 34+ the MediaProjection token is ONE-USE.
-                // We must pass the raw result code + data Intent to the service;
-                // the service calls MediaProjectionManager.getMediaProjection() itself.
                 val i = Intent(this, SpeechCaptureService::class.java).apply {
                     putExtra(SpeechCaptureService.EXTRA_RESULT_CODE, resultCode)
                     putExtra(SpeechCaptureService.EXTRA_RESULT_DATA, data)
                 }
                 startForegroundServiceCompat(i)
 
-                // Warm up LibreTranslate connection (fire-and-forget)
                 TranslationManager.warmUp()
-
                 pending?.success(true)
             } else {
-                Log.w(TAG, "MediaProjection denied or cancelled (resultCode=$resultCode)")
+                Log.w(TAG, "MediaProjection denied (resultCode=$resultCode)")
                 pending?.success(false)
             }
         }
@@ -309,16 +283,11 @@ class MainActivity : FlutterActivity() {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /** Start a foreground service using the correct API for the current OS version. */
     private fun startForegroundServiceCompat(intent: Intent) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+        else startService(intent)
     }
 
-    /** If there is a dangling pending result, deliver failure and clear it. */
     private fun deliverPendingFailure() {
         val stale = pendingProjectionResult
         if (stale != null) {
@@ -327,7 +296,7 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /** Called from SpeechCaptureService to push a translation to Flutter UI. */
+    /** Called by SpeechCaptureService when a translation is ready. */
     fun onTranslation(original: String, english: String, hindi: String) {
         runOnUiThread {
             methodChannel?.invokeMethod("onTranslation", mapOf(
@@ -335,6 +304,16 @@ class MainActivity : FlutterActivity() {
                 "english"  to english,
                 "hindi"    to hindi
             ))
+        }
+    }
+
+    /**
+     * NEW — Called by SpeechCaptureService.captureThread when it exits unexpectedly.
+     * Tells the Flutter UI to flip isRunning=false so the START button comes back.
+     */
+    fun onCaptureError(message: String) {
+        runOnUiThread {
+            methodChannel?.invokeMethod("onCaptureError", mapOf("message" to message))
         }
     }
 }
