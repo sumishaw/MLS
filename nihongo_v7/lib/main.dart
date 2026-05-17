@@ -48,6 +48,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   int    translationCount = 0;
   bool   _micPulse        = false;
   Timer? _pulseTimer;
+  // Health-check: polls isSpeechCaptureRunning every 3 s while running.
+  // Catches the zombie-service case (thread dead but service alive) that
+  // the onCaptureError callback alone cannot guarantee to deliver.
+  Timer? _healthTimer;
 
   // Model download state
   ModelState modelState   = ModelState.checking;
@@ -96,7 +100,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             modelErrorMsg = a['message']?.toString() ?? 'Unknown error';
           });
           break;
-      }
+        // NEW: called by SpeechCaptureService when capture thread dies unexpectedly.
+        // Without this, isRunning stays true and the START button never comes back.
+        case 'onCaptureError':
+          final a = call.arguments as Map? ?? {};
+          final msg = a['message']?.toString() ?? 'Capture stopped unexpectedly';
+          if (mounted) {
+            _stopHealthTimer();
+            _pulseTimer?.cancel();
+            setState(() {
+              isRunning   = false;
+              statusMsg   = '⚠️ $msg';
+              displayText = 'Tap START → approve screen capture → play any video…';
+              originalText = '';
+            });
+          }
+          break;
     });
 
     _checkPermissions();
@@ -159,6 +178,34 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
+  // ── Health-check timer ─────────────────────────────────────────────────────
+
+  void _startHealthTimer() {
+    _stopHealthTimer();
+    _healthTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+      if (!isRunning || !mounted) { _stopHealthTimer(); return; }
+      try {
+        final still = await _ch.invokeMethod<bool>('isSpeechCaptureRunning') ?? false;
+        if (!still && mounted && isRunning) {
+          // Service died without calling onCaptureError — self-correct the UI
+          _stopHealthTimer();
+          _pulseTimer?.cancel();
+          setState(() {
+            isRunning    = false;
+            statusMsg    = '⚠️ Capture stopped — tap START again.';
+            displayText  = 'Tap START → approve screen capture → play any video…';
+            originalText = '';
+          });
+        }
+      } catch (_) {}
+    });
+  }
+
+  void _stopHealthTimer() {
+    _healthTimer?.cancel();
+    _healthTimer = null;
+  }
+
   Future<void> _setLanguage(String lang) async {
     await _ch.invokeMethod('setTargetLanguage', {'language': lang});
     if (mounted) setState(() {
@@ -196,6 +243,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     _pulseTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
       if (mounted) setState(() => _micPulse = !_micPulse);
     });
+    _startHealthTimer();
 
     if (mounted) setState(() {
       isRunning        = true;
@@ -208,6 +256,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _stop() async {
     _pulseTimer?.cancel();
+    _stopHealthTimer();
     _micPulse = false;
     await _ch.invokeMethod('stopSpeechCapture');
     await _ch.invokeMethod('stopOverlay');
@@ -222,6 +271,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     _pulseTimer?.cancel();
+    _stopHealthTimer();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
