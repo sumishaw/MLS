@@ -16,20 +16,39 @@ import org.vosk.Model
 import org.vosk.Recognizer
 
 /**
- * SpeechCaptureService
+ * SpeechCaptureService  —  PERFORMANCE-FIXED
  *
- * Captures INTERNAL device audio (YouTube, VLC, Chrome, offline videos) using
- * MediaProjection + AudioPlaybackCaptureConfiguration and feeds raw PCM to Vosk.
+ * Root-cause fixes for tablet sluggishness / capture dying / LibreTranslate jobs stalling:
  *
- * KEY CRASH FIXES:
- *  1. startForeground() called synchronously in onCreate() before ANY async work.
- *     On API 29-33 this was missing, causing ForegroundServiceStartNotAllowedException.
- *  2. MediaProjection is obtained inside the service from the raw resultCode/data,
- *     NOT passed as a Parcelable (token is one-use and cannot be marshalled on API 34).
- *  3. AudioRecord.Builder used with AudioPlaybackCaptureConfiguration — never the
- *     deprecated AudioRecord() constructor which requires RECORD_AUDIO on API 34.
- *  4. All AudioRecord/Vosk objects are released on ANY exit path (null-safe cleanup).
- *  5. WakeLock released in a finally block so it never leaks on crash.
+ *  FIX 1 – Thread priority
+ *    AudioCaptureThread was set to MAX_PRIORITY.  On Android that steals CPU time from the
+ *    main thread (UI, MediaPlayer, Chrome renderer) causing the video stuttering / freeze you
+ *    see.  Changed to NORM_PRIORITY – the audio read loop is I/O-bound, not CPU-bound.
+ *
+ *  FIX 2 – Translation rate-limiting / debounce
+ *    Every Vosk partial result fired mainHandler.post { processText() }, which in turn
+ *    dispatched TWO LibreTranslate HTTP calls (en→hi chain).  A lively audio stream can
+ *    produce 15-30 partials per second.  That's 30-60 concurrent HTTP calls piling up in
+ *    the executor, saturating the tablet's loopback TCP stack and starving LibreTranslate.
+ *    Fix: a 600 ms debounce – only the most-recent text is sent per window, identical to
+ *    how a search-as-you-type field works.  Final (non-partial) results still fire instantly.
+ *
+ *  FIX 3 – Read buffer alignment
+ *    readBuf was 4096 bytes but bufSize was maxOf(minBuf*4, 8192).  AudioRecord.read() can
+ *    return up to bufSize bytes; anything > readBuf silently truncated the PCM frame and
+ *    confused Vosk.  readBuf is now allocated at the same bufSize as the AudioRecord ring.
+ *
+ *  FIX 4 – WakeLock timeout extended
+ *    1-hour cap meant capture silently died on long sessions.  Changed to 4 hours (still
+ *    auto-released in onDestroy).  Adjust to taste.
+ *
+ *  FIX 5 – TranslationManager executor saturation guard
+ *    Before submitting to executor, check queue depth (approximate via activeCount vs
+ *    corePoolSize) and drop excess work rather than pile it on.  See TranslationManager.
+ *
+ *  FIX 6 – Vosk model loaded at NORM_PRIORITY
+ *    Was NORM_PRIORITY already, kept; just confirmed isDaemon=false stays so it completes
+ *    after the app goes background.
  */
 class SpeechCaptureService : Service() {
 
@@ -45,8 +64,12 @@ class SpeechCaptureService : Service() {
         @Volatile var latestEnglish  = ""
         @Volatile var latestHindi    = ""
 
-        private const val TAG         = "SpeechCapture"
-        private const val SAMPLE_RATE = 16_000
+        private const val TAG          = "SpeechCapture"
+        private const val SAMPLE_RATE  = 16_000
+
+        // ── FIX 2: debounce interval for partial results ──────────────────────
+        // Final (isFinal=true) results are never debounced.
+        private const val PARTIAL_DEBOUNCE_MS = 600L
     }
 
     private val mainHandler  = Handler(Looper.getMainLooper())
@@ -59,6 +82,9 @@ class SpeechCaptureService : Service() {
     private var wakeLock:      PowerManager.WakeLock? = null
     private var lastPushedText = ""
 
+    // FIX 2: pending debounce state
+    private var debounceRunnable: Runnable? = null
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
@@ -66,9 +92,6 @@ class SpeechCaptureService : Service() {
         isRunning = true
         createNotificationChannel()
 
-        // MUST call startForeground() immediately in onCreate() — before ANY async work.
-        // On Android 12+ the system kills a service that hasn't called startForeground()
-        // within ~10 seconds. Calling it here guarantees we're always within the window.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIF_ID,
@@ -80,13 +103,13 @@ class SpeechCaptureService : Service() {
             startForeground(NOTIF_ID, buildNotification("Initialising…"))
         }
 
-        // Partial WakeLock: keeps CPU alive while screen is off
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         @Suppress("WakelockTimeout")
+        // FIX 4: 4-hour max instead of 1-hour (released in onDestroy regardless)
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "CaptionLens::SpeechCapture"
-        ).also { it.acquire(60 * 60 * 1000L) }    // max 1 hour
+        ).also { it.acquire(4 * 60 * 60 * 1000L) }
 
         Log.d(TAG, "onCreate — foreground started, wakeLock acquired")
     }
@@ -109,9 +132,6 @@ class SpeechCaptureService : Service() {
             stopSelf(); return START_NOT_STICKY
         }
 
-        // Obtain the MediaProjection object inside the service.
-        // This MUST happen in onStartCommand (not onCreate) because the token is
-        // only valid from the intent that delivered it.
         try {
             val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjection = mgr.getMediaProjection(resultCode, resultData)
@@ -125,7 +145,6 @@ class SpeechCaptureService : Service() {
             stopSelf(); return START_NOT_STICKY
         }
 
-        // Register stop-callback for API 34+ (projection stops externally e.g. user revokes)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             mediaProjection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
@@ -146,29 +165,27 @@ class SpeechCaptureService : Service() {
         isRunning = false
         capturing.set(false)
 
-        // Stop capture thread
+        // Cancel any pending debounce
+        debounceRunnable?.let { mainHandler.removeCallbacks(it) }
+        debounceRunnable = null
+
         captureThread?.interrupt()
         captureThread = null
 
-        // Release AudioRecord
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
 
-        // Release Vosk
         try { voskRec?.close() } catch (_: Exception) {}
         try { voskModel?.close() } catch (_: Exception) {}
         voskRec   = null
         voskModel = null
 
-        // Stop MediaProjection
         try { mediaProjection?.stop() } catch (_: Exception) {}
         mediaProjection = null
 
-        // Cancel pending handlers
         mainHandler.removeCallbacksAndMessages(null)
 
-        // Release WakeLock in a finally-style check
         try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
         wakeLock = null
 
@@ -203,7 +220,6 @@ class SpeechCaptureService : Service() {
                         || msg.contains("invalid", ignoreCase = true)
                         || msg.contains("corrupt", ignoreCase = true)
                 if (isCorrupt) {
-                    // Wipe corrupt files so next launch triggers a fresh download
                     ModelDownloadService.modelDir(this).deleteRecursively()
                     try { java.io.File(filesDir, "vosk_model_ready").delete() } catch (_: Exception) {}
                     mainHandler.post {
@@ -218,7 +234,7 @@ class SpeechCaptureService : Service() {
                 }
             }
         }, "VoskModelLoader").apply {
-            isDaemon = false          // must finish even if app goes background
+            isDaemon = false
             priority = Thread.NORM_PRIORITY
             start()
         }
@@ -245,7 +261,6 @@ class SpeechCaptureService : Service() {
             stopSelf(); return
         }
 
-        // Calculate buffer sizes
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
@@ -258,8 +273,6 @@ class SpeechCaptureService : Service() {
         }
         val bufSize = maxOf(minBuf * 4, 8192)
 
-        // Build AudioPlaybackCaptureConfiguration — captures internal audio,
-        // NOT microphone, despite needing RECORD_AUDIO permission
         val captureConfig = android.media.AudioPlaybackCaptureConfiguration
             .Builder(projection)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
@@ -267,7 +280,6 @@ class SpeechCaptureService : Service() {
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
             .build()
 
-        // Use AudioRecord.Builder — required for AudioPlaybackCaptureConfiguration
         val ar = try {
             AudioRecord.Builder()
                 .setAudioFormat(
@@ -294,7 +306,6 @@ class SpeechCaptureService : Service() {
         }
         audioRecord = ar
 
-        // Build Vosk recogniser (full vocabulary — no grammar)
         voskRec = try {
             Recognizer(model, SAMPLE_RATE.toFloat())
         } catch (e: Exception) {
@@ -311,7 +322,9 @@ class SpeechCaptureService : Service() {
         Log.d(TAG, "Capture started (bufSize=$bufSize)")
 
         captureThread = Thread({
-            val readBuf = ByteArray(4096)
+            // FIX 3: readBuf matches the AudioRecord ring buffer size
+            val readBuf = ByteArray(bufSize)
+
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
                 val rec = audioRecord ?: break
                 val read = rec.read(readBuf, 0, readBuf.size)
@@ -328,19 +341,32 @@ class SpeechCaptureService : Service() {
                     val isFinal = recognizer.acceptWaveForm(readBuf, read)
                     val json    = if (isFinal) recognizer.result else recognizer.partialResult
                     val text    = parseVoskJson(json)
+
                     if (text.length >= 3 && text != lastPushedText) {
                         lastPushedText = text
-                        mainHandler.post { processText(text) }
+                        if (isFinal) {
+                            // FIX 2a: final results cancel any pending debounce and fire immediately
+                            debounceRunnable?.let { mainHandler.removeCallbacks(it) }
+                            debounceRunnable = null
+                            mainHandler.post { processText(text) }
+                        } else {
+                            // FIX 2b: partials are debounced — only the last one in the window fires
+                            debounceRunnable?.let { mainHandler.removeCallbacks(it) }
+                            val r = Runnable { processText(text) }
+                            debounceRunnable = r
+                            mainHandler.postDelayed(r, PARTIAL_DEBOUNCE_MS)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Vosk error: ${e.message}")
-                    // Continue — single-frame errors are usually recoverable
                 }
             }
             Log.d(TAG, "Capture thread ended")
         }, "AudioCaptureThread").apply {
             isDaemon = false
-            priority = Thread.MAX_PRIORITY
+            // FIX 1: NORM_PRIORITY — the read loop is I/O-bound.
+            // MAX_PRIORITY stole CPU from MediaPlayer/Chrome causing video sluggishness.
+            priority = Thread.NORM_PRIORITY
             start()
         }
     }
