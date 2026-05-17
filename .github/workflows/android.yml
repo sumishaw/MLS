@@ -1,0 +1,134 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build & Sign APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Java 17 (matches compileOptions / kotlinOptions) ────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # ── 3. Flutter SDK ─────────────────────────────────────────────────────
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'   # pin to a stable 3.x that supports Dart >=3.0.0 <4.0.0
+          channel: 'stable'
+          cache: true
+
+      # ── 4. Print versions for debugging ────────────────────────────────────
+      - name: Print Flutter & Dart versions
+        run: |
+          flutter --version
+          dart --version
+          java -version
+
+      # ── 5. Install Flutter dependencies ────────────────────────────────────
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # ── 6. Lint / analyse ──────────────────────────────────────────────────
+      - name: Run Flutter analyze
+        run: flutter analyze --no-fatal-infos
+
+      # ── 7. Unit tests ─────────────────────────────────────────────────────
+      - name: Run Flutter tests
+        run: flutter test
+
+      # ── 8. Grant Gradle wrapper execute permission ─────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      # ── 9. Build debug APK (always) ────────────────────────────────────────
+      - name: Build debug APK
+        run: flutter build apk --debug --verbose
+
+      # ── 10. Build release APK ──────────────────────────────────────────────
+      #   Uses the debug signing config defined in build.gradle (signingConfigs.debug).
+      #   Replace with a proper keystore secret when you have one.
+      - name: Build release APK
+        run: flutter build apk --release --verbose
+
+      # ── 11. (Optional) Build App Bundle for Play Store ─────────────────────
+      - name: Build release App Bundle
+        run: flutter build appbundle --release --verbose
+
+      # ── 12. Upload debug APK artifact ──────────────────────────────────────
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: caption-lens-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 14
+
+      # ── 13. Upload release APK artifact ────────────────────────────────────
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: caption-lens-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 14
+
+      # ── 14. Upload App Bundle artifact ─────────────────────────────────────
+      - name: Upload release App Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: caption-lens-release-aab
+          path: build/app/outputs/bundle/release/app-release.aab
+          retention-days: 14
+
+  # ── Optional: release job triggered only on version tags ──────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: caption-lens-release-apk
+          path: ./release-artifacts
+
+      - name: Download release AAB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: caption-lens-release-aab
+          path: ./release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Caption Lens ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            ./release-artifacts/app-release.apk
+            ./release-artifacts/app-release.aab
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
