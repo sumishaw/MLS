@@ -8,7 +8,8 @@ on:
   workflow_dispatch:
 
 env:
-  PROJECT_DIR: nihongo_v7   # Flutter project lives in this subdirectory
+  PROJECT_DIR: nihongo_v7        # Flutter project subdirectory
+  GRADLE_VERSION: "8.7"          # Must match gradle-wrapper.properties distributionUrl
 
 jobs:
   build:
@@ -20,7 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Java 17 (matches compileOptions / kotlinOptions in build.gradle) ─
+      # ── 2. Java 17 ── matches compileOptions + kotlinOptions in build.gradle ─
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -36,65 +37,55 @@ jobs:
           channel: 'stable'
           cache: true
 
-      # ── 4. Print versions for debugging ────────────────────────────────────
-      - name: Print Flutter & Dart versions
-        run: |
-          flutter --version
-          dart --version
-          java -version
-
-      # ── 5. Disable Flutter analytics (avoids interactive prompt in CI) ─────
+      # ── 4. Disable Flutter analytics (suppresses interactive prompt) ───────
       - name: Disable Flutter analytics
         run: flutter config --no-analytics
-        working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 6. Install Flutter dependencies ────────────────────────────────────
+      # ── 5. Flutter pub get ─────────────────────────────────────────────────
       - name: Flutter pub get
         run: flutter pub get
         working-directory: ${{ env.PROJECT_DIR }}
 
+      # ── 6. Generate Gradle wrapper ─────────────────────────────────────────
+      #   gradlew is NOT committed to this repo, so we generate it here.
+      #   The version must match distributionUrl in gradle-wrapper.properties.
+      - name: Generate Gradle wrapper
+        run: |
+          gradle wrapper --gradle-version ${{ env.GRADLE_VERSION }} --distribution-type all
+          chmod +x gradlew
+        working-directory: ${{ env.PROJECT_DIR }}/android
+
       # ── 7. Lint / analyse ──────────────────────────────────────────────────
-      #   continue-on-error: true so analysis warnings never block the APK build.
-      #   Info-level lint hints (curly_braces_in_flow_control_structures) are
-      #   suppressed by --no-fatal-infos; only real errors are printed.
+      #   continue-on-error keeps info/warning-level lint from blocking the build.
       - name: Run Flutter analyze
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
         working-directory: ${{ env.PROJECT_DIR }}
         continue-on-error: true
 
       # ── 8. Unit / widget tests ─────────────────────────────────────────────
-      #   Runs on ubuntu-latest which has no display; flutter test uses the
-      #   flutter_test headless renderer so no Xvfb is needed.
-      #   continue-on-error: true so test failures surface in the log but
-      #   do not prevent the APK from being built and uploaded.
       - name: Run Flutter tests
         run: flutter test --reporter compact
         working-directory: ${{ env.PROJECT_DIR }}
         continue-on-error: true
 
-      # ── 9. Grant Gradle wrapper execute permission ─────────────────────────
-      - name: Make gradlew executable
-        run: chmod +x android/gradlew
-        working-directory: ${{ env.PROJECT_DIR }}
-
-      # ── 10. Build debug APK ────────────────────────────────────────────────
+      # ── 9. Build debug APK ─────────────────────────────────────────────────
       - name: Build debug APK
         run: flutter build apk --debug --verbose
         working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 11. Build release APK ──────────────────────────────────────────────
-      #   Uses debug signing config (signingConfigs.debug) from build.gradle.
-      #   Swap for a real keystore secret when ready for production.
+      # ── 10. Build release APK ──────────────────────────────────────────────
+      #   Uses signingConfigs.debug defined in app/build.gradle.
+      #   Swap for a real keystore secret when releasing to the Play Store.
       - name: Build release APK
         run: flutter build apk --release --verbose
         working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 12. Build App Bundle for Play Store ───────────────────────────────
+      # ── 11. Build App Bundle for Play Store ───────────────────────────────
       - name: Build release App Bundle
         run: flutter build appbundle --release --verbose
         working-directory: ${{ env.PROJECT_DIR }}
 
-      # ── 13. Upload debug APK artifact ─────────────────────────────────────
+      # ── 12. Upload debug APK ───────────────────────────────────────────────
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
@@ -102,7 +93,7 @@ jobs:
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 14
 
-      # ── 14. Upload release APK artifact ───────────────────────────────────
+      # ── 13. Upload release APK ─────────────────────────────────────────────
       - name: Upload release APK
         uses: actions/upload-artifact@v4
         with:
@@ -110,7 +101,7 @@ jobs:
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
           retention-days: 14
 
-      # ── 15. Upload App Bundle artifact ────────────────────────────────────
+      # ── 14. Upload release App Bundle ──────────────────────────────────────
       - name: Upload release App Bundle
         uses: actions/upload-artifact@v4
         with:
@@ -118,7 +109,7 @@ jobs:
           path: ${{ env.PROJECT_DIR }}/build/app/outputs/bundle/release/app-release.aab
           retention-days: 14
 
-  # ── Optional: GitHub Release created only on version tags (e.g. v7.0.0) ──
+  # ── GitHub Release — only on version tags e.g. git tag v7.0.0 ────────────
   release:
     name: Create GitHub Release
     needs: build
@@ -132,13 +123,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download release APK artifact
+      - name: Download release APK
         uses: actions/download-artifact@v4
         with:
           name: caption-lens-release-apk
           path: ./release-artifacts
 
-      - name: Download release AAB artifact
+      - name: Download release AAB
         uses: actions/download-artifact@v4
         with:
           name: caption-lens-release-aab
